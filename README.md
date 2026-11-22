@@ -1,6 +1,8 @@
 # Midnight Vault — The Meridian Heist
 
-[![make.fun](https://make.fun/badge.svg)](https://make.fun/bounty/best-heist-game-20261122-0559) [![Play on make.fun](https://make.fun/play-badge.svg)](https://make.fun/bounty/best-heist-game-20261122-0559)
+[![make.fun · best-heist-game-20261122-0559](https://make.fun/badge/best-heist-game-20261122-0559.svg)](https://make.fun/bounty/best-heist-game-20261122-0559?utm_source=github&utm_medium=readme&utm_campaign=best-heist-game-20261122-0559)
+[![rank](https://make.fun/badge/best-heist-game-20261122-0559/dzatm/midnight-vault-heist/rank.svg)](https://make.fun/bounty/best-heist-game-20261122-0559/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-heist-game-20261122-0559)
+[![reward](https://make.fun/badge/best-heist-game-20261122-0559/dzatm/midnight-vault-heist/reward.svg)](https://make.fun/bounty/best-heist-game-20261122-0559?utm_source=github&utm_medium=readme&utm_campaign=best-heist-game-20261122-0559)
 
 An original top-down stealth heist game, built for the make.fun bounty
 **"Make the best heist game"** (best-heist-game-20261122-0559), account
