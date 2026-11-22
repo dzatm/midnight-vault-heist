@@ -1,0 +1,1752 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Midnight Vault — The Meridian Heist</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e16; }
+  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  /* Read aloud, never shown: the status line screen readers announce. */
+  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Midnight Vault: a top-down heist game. Steal the keycard, crack the safe, and escape before the guards or the alarm catch you."></canvas>
+<p id="status" role="status" aria-live="polite"></p>
+<script>
+
+// ---- config.js ----
+// Midnight Vault — every tuning number and colour in one place.
+// The playfield is a fixed 960x600 logical area with a 64px HUD bar on top;
+// the renderer scales the 960x664 canvas to the window, so no rule below
+// depends on the screen size. No sound: the game is fully playable silent.
+const FIELD = { width: 960, height: 600, hud: 64 };
+const CANVAS = { width: 960, height: 664 };
+
+/** The simulation's fixed step, in seconds: 60 updates a second. */
+const STEP = 1 / 60;
+
+/** Seconds of play per level. */
+const LEVEL_TIME = 120;
+
+const THIEF = { radius: 13, speed: 168 };
+
+const GUARD = { radius: 14, closeRange: 30 };
+
+/** Vision cone: how far a guard or camera sees, and its half-angle. */
+const CONE = { guardRange: 178, cameraRange: 205, halfAngle: 0.55 };
+
+/** Alarm 0..100. Rises fast while seen, decays while hidden. */
+const ALARM = {
+  risePerSecond: 70,
+  cameraRisePerSecond: 60,
+  decayPerSecond: 26,
+  plateHit: 45,
+  spottedAt: 100,
+  /** Seconds the thief has to break line of sight once fully spotted. */
+  countdownSeconds: 3,
+};
+
+/** EMP tool: one per level, costs score, kills cameras and lasers. */
+const EMP = { chargesPerLevel: 1, cost: 20, disableSeconds: 6 };
+
+/** Safe cracking: hold near the safe with the keycard. */
+const SAFE = { points: 60, crackSeconds: 6, openAt: 0.5 };
+
+const LOOT_POINTS = { gold: 10, gem: 15, cash: 10 };
+
+/** Level-end section scores (each 0..100): routes / alarm / safe. */
+const SECTION = { routes: 0, alarm: 1, safe: 2 };
+
+const PALETTE = {
+  backdrop: '#0b0e16',
+  hud: '#12162a',
+  hudLine: '#2a3352',
+  floorA: '#1d2338',
+  floorB: '#181d2e',
+  carpet: '#232a4a',
+  wall: '#3a4266',
+  wallTop: '#5a6494',
+  wallGold: '#c9a227',
+  cover: '#2c3352',
+  text: '#eef1f5',
+  muted: '#9aa3c0',
+  gold: '#f2c94c',
+  goldDark: '#b8860b',
+  gem: '#4dd8ff',
+  cash: '#5fd68a',
+  thief: '#14141c',
+  thiefTrim: '#f2c94c',
+  guard: '#2b4a7a',
+  guardVisor: '#dfe8ff',
+  cone: 'rgba(255, 64, 64, 0.20)',
+  coneEdge: 'rgba(255, 90, 90, 0.55)',
+  cameraCone: 'rgba(255, 170, 40, 0.18)',
+  cameraConeEdge: 'rgba(255, 180, 60, 0.5)',
+  laser: '#ff2e4d',
+  laserOff: 'rgba(255, 46, 77, 0.18)',
+  plate: '#3d2b4d',
+  plateHot: '#ff2e4d',
+  exitClosed: '#c0392b',
+  exitOpen: '#2ecc71',
+  safe: '#4a5268',
+  safeDark: '#2f3547',
+  keycard: '#4dd8ff',
+  danger: '#ff4757',
+  ok: '#2ecc71',
+};
+
+const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+
+/** Where the best total score is kept between visits (this browser only). */
+const BEST_KEY = 'midnight-vault.best';
+
+// ---- levels.js ----
+// Midnight Vault — the two levels. Every room is drawn from these plain
+// data tables, so a level is a set of walls, patrol routes, traps and loot.
+// Walls are solid rectangles: they block movement and line of sight.
+// Each level is scored in three sections of 100 points — guard routes,
+// alarm discipline, and the safe — shown on the level-complete screen.
+
+const BORDER = [
+  { x: 0, y: 0, w: 960, h: 16 },
+  { x: 0, y: 584, w: 960, h: 16 },
+  { x: 0, y: 0, w: 16, h: 600 },
+  { x: 944, y: 0, w: 16, h: 600 },
+];
+
+/** Level 1 — "The Gallery": a museum wing. Two guards, one camera, one
+ *  laser, one pressure plate. Three ways through: top corridor, bottom
+ *  corridor, and the middle hall past the patrolling guard. */
+const LEVEL_1 = {
+  name: 'LEVEL 1 — THE GALLERY',
+  sub: 'Museum wing · two guards · one camera',
+  start: { x: 62, y: 540 },
+  walls: [
+    ...BORDER,
+    // Gallery / hall divider: gaps at the top and bottom corridors.
+    { x: 300, y: 140, w: 18, h: 280 },
+    // Hall / vault-room divider: one door in the middle.
+    { x: 640, y: 16, w: 18, h: 180 },
+    { x: 640, y: 330, w: 18, h: 254 },
+    // Cover in the middle hall.
+    { x: 380, y: 330, w: 180, h: 18 },
+    // Crates to hide behind.
+    { x: 420, y: 120, w: 70, h: 46 },
+    { x: 700, y: 380, w: 80, h: 46 },
+    { x: 120, y: 300, w: 70, h: 46 },
+  ],
+  guards: [
+    {
+      waypoints: [{ x: 360, y: 90 }, { x: 600, y: 90 }],
+      speed: 56,
+      wait: 0.9,
+    },
+    {
+      waypoints: [{ x: 600, y: 200 }, { x: 600, y: 480 }],
+      speed: 52,
+      wait: 0.7,
+    },
+  ],
+  cameras: [
+    { x: 700, y: 24, baseAngle: Math.PI / 2, sweep: 0.7, speed: 0.55 },
+  ],
+  lasers: [
+    { x1: 560, y1: 380, x2: 560, y2: 520, period: 3.4, onTime: 2.0, phase: 0 },
+  ],
+  plates: [{ x: 756, y: 296, w: 52, h: 52 }],
+  loot: [
+    { x: 380, y: 500, kind: 'gold' },
+    { x: 600, y: 460, kind: 'gold' },
+    { x: 730, y: 250, kind: 'gem' },
+    { x: 880, y: 300, kind: 'cash' },
+  ],
+  keycard: { x: 90, y: 90 },
+  safe: { x: 852, y: 64, w: 76, h: 62 },
+  exit: { x: 876, y: 500, w: 56, h: 56 },
+};
+
+/** Level 2 — "The Vault": a bank vault floor. Three guards, two cameras,
+ *  two lasers, two pressure plates, and a central vault that must be
+ *  cracked while two patrols cross in front of it. */
+const LEVEL_2 = {
+  name: 'LEVEL 2 — THE VAULT',
+  sub: 'Bank vault floor · three guards · two cameras',
+  start: { x: 62, y: 62 },
+  walls: [
+    ...BORDER,
+    // Upper / lower divider: gaps at the far left and far right.
+    { x: 220, y: 290, w: 300, h: 18 },
+    { x: 640, y: 290, w: 160, h: 18 },
+    // Vault room walls: door at the bottom centre.
+    { x: 380, y: 120, w: 18, h: 170 },
+    { x: 562, y: 120, w: 18, h: 170 },
+    { x: 380, y: 120, w: 200, h: 18 },
+    // Cover and teller desks.
+    { x: 120, y: 420, w: 90, h: 44 },
+    { x: 700, y: 420, w: 90, h: 44 },
+    { x: 700, y: 120, w: 70, h: 44 },
+    { x: 120, y: 150, w: 70, h: 44 },
+  ],
+  guards: [
+    {
+      waypoints: [{ x: 240, y: 90 }, { x: 880, y: 90 }],
+      speed: 64,
+      wait: 0.6,
+    },
+    {
+      waypoints: [{ x: 300, y: 380 }, { x: 300, y: 520 }],
+      speed: 58,
+      wait: 0.8,
+    },
+    {
+      waypoints: [{ x: 660, y: 380 }, { x: 660, y: 520 }],
+      speed: 58,
+      wait: 0.8,
+    },
+  ],
+  cameras: [
+    { x: 480, y: 24, baseAngle: Math.PI / 2, sweep: 0.8, speed: 0.6 },
+    { x: 936, y: 300, baseAngle: Math.PI, sweep: 0.6, speed: 0.5 },
+  ],
+  lasers: [
+    { x1: 220, y1: 470, x2: 220, y2: 540, period: 3.0, onTime: 1.8, phase: 1.2 },
+    { x1: 740, y1: 470, x2: 740, y2: 540, period: 3.0, onTime: 1.8, phase: 0 },
+  ],
+  plates: [
+    { x: 448, y: 320, w: 52, h: 52 },
+    { x: 800, y: 320, w: 52, h: 52 },
+  ],
+  loot: [
+    { x: 160, y: 240, kind: 'gold' },
+    { x: 900, y: 250, kind: 'gem' },
+    { x: 480, y: 540, kind: 'gold' },
+    { x: 760, y: 540, kind: 'cash' },
+    { x: 200, y: 540, kind: 'gem' },
+  ],
+  keycard: { x: 880, y: 210 },
+  safe: { x: 442, y: 180, w: 76, h: 62 },
+  exit: { x: 48, y: 500, w: 56, h: 56 },
+};
+
+const LEVELS = [LEVEL_1, LEVEL_2];
+
+/** Points a level holds: loot plus the safe. */
+function levelTotalPoints(level) {
+  let total = 0;
+  for (const item of level.loot) total += LOOT_POINTS[item.kind];
+  return total + 60;
+}
+
+// ---- input.js ----
+// Midnight Vault — keyboard and pointer input. Held keys give a steering
+// vector; one-shot presses (confirm, pause, EMP) are queued as flags and
+// taken once by the loop, so a press between two frames is never lost.
+// Pointer: click / drag on the floor sets a move target for the thief.
+const ACTION_CONFIRM = 1;
+const ACTION_PAUSE = 2;
+const ACTION_EMP = 4;
+
+const UP = new Set(['ArrowUp', 'KeyW']);
+const DOWN = new Set(['ArrowDown', 'KeyS']);
+const LEFT = new Set(['ArrowLeft', 'KeyA']);
+const RIGHT = new Set(['ArrowRight', 'KeyD']);
+const CONFIRM = new Set(['Space', 'Enter']);
+const PAUSE = new Set(['KeyP', 'Escape']);
+const EMP_KEYS = new Set(['KeyE']);
+
+function createInput(target, toLogical) {
+  const held = { up: false, down: false, left: false, right: false };
+  let actions = 0;
+  let moveTarget = null;
+  let pointerDown = false;
+
+  window.addEventListener('keydown', (event) => {
+    if (UP.has(event.code)) held.up = true;
+    else if (DOWN.has(event.code)) held.down = true;
+    else if (LEFT.has(event.code)) held.left = true;
+    else if (RIGHT.has(event.code)) held.right = true;
+    else if (CONFIRM.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_CONFIRM;
+    } else if (PAUSE.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_PAUSE;
+    } else if (EMP_KEYS.has(event.code)) {
+      if (!event.repeat) actions |= ACTION_EMP;
+    } else return;
+    event.preventDefault();
+  });
+  window.addEventListener('keyup', (event) => {
+    if (UP.has(event.code)) held.up = false;
+    else if (DOWN.has(event.code)) held.down = false;
+    else if (LEFT.has(event.code)) held.left = false;
+    else if (RIGHT.has(event.code)) held.right = false;
+  });
+  // A key released while the tab is hidden never sends keyup.
+  window.addEventListener('blur', () => {
+    held.up = held.down = held.left = held.right = false;
+    pointerDown = false;
+  });
+
+  target.addEventListener('pointerdown', (event) => {
+    pointerDown = true;
+    moveTarget = toLogical(event.clientX, event.clientY);
+    actions |= ACTION_CONFIRM;
+  });
+  target.addEventListener('pointermove', (event) => {
+    if (pointerDown) moveTarget = toLogical(event.clientX, event.clientY);
+  });
+  window.addEventListener('pointerup', () => {
+    pointerDown = false;
+  });
+
+  return {
+    /** Normalised steering vector from held keys, or null. */
+    keys() {
+      const x = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+      const y = (held.down ? 1 : 0) - (held.up ? 1 : 0);
+      if (x === 0 && y === 0) return null;
+      const len = Math.hypot(x, y);
+      return { x: x / len, y: y / len };
+    },
+    /** Click-to-move target in logical coordinates, or null. */
+    moveTarget() {
+      return moveTarget;
+    },
+    clearMoveTarget() {
+      moveTarget = null;
+    },
+    takeActions() {
+      const taken = actions;
+      actions = 0;
+      return taken;
+    },
+  };
+}
+
+// ---- world.js ----
+// Midnight Vault — the simulation. Pure logic, no DOM: the same code runs
+// in the browser and in a headless Node test. One fixed step (1/60 s)
+// advances guards, cameras, lasers, the alarm, the safe and the thief.
+
+const EVENT_NONE = 0;
+const EVENT_LOOT = 1;
+const EVENT_KEYCARD = 2;
+const EVENT_SAFE_TICK = 4;
+const EVENT_EMP = 8;
+const EVENT_CAUGHT = 16;
+const EVENT_LEVEL_DONE = 32;
+const EVENT_WON = 64;
+const EVENT_TIMEOUT = 128;
+
+const STEP_SECONDS = STEP;
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return Math.abs(d);
+}
+
+/** True when the segment is blocked by any wall (sampled). */
+function lineBlocked(x1, y1, x2, y2, walls) {
+  const steps = 14;
+  for (let i = 1; i < steps; i += 1) {
+    const t = i / steps;
+    const x = x1 + (x2 - x1) * t;
+    const y = y1 + (y2 - y1) * t;
+    for (const w of walls) {
+      if (x > w.x && x < w.x + w.w && y > w.y && y < w.y + w.h) return true;
+    }
+  }
+  return false;
+}
+
+/** Distance from a point to a segment. */
+function pointSegmentDistance(px, py, x1, y1, x2, y2) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - x1) * dx + (py - y1) * dy) / len2;
+  t = clamp(t, 0, 1);
+  return Math.hypot(px - (x1 + dx * t), py - (y1 + dy * t));
+}
+
+function circleHitsRect(cx, cy, r, rect) {
+  const nx = clamp(cx, rect.x, rect.x + rect.w);
+  const ny = clamp(cy, rect.y, rect.y + rect.h);
+  return (cx - nx) * (cx - nx) + (cy - ny) * (cy - ny) < r * r;
+}
+
+function moveCircle(state, x, y, dx, dy) {
+  const r = THIEF.radius;
+  let nx = x + dx;
+  for (const w of state.level.walls) {
+    if (circleHitsRect(nx, y, r, w)) {
+      nx = dx > 0 ? w.x - r : w.x + w.w + r;
+    }
+  }
+  let ny = y + dy;
+  for (const w of state.level.walls) {
+    if (circleHitsRect(nx, ny, r, w)) {
+      ny = dy > 0 ? w.y - r : w.y + w.h + r;
+    }
+  }
+  return { x: clamp(nx, r, FIELD.width - r), y: clamp(ny, r, FIELD.height - r) };
+}
+
+function createWorld() {
+  const state = {
+    levelIndex: 0,
+    level: LEVELS[0],
+    thief: { x: 0, y: 0, angle: 0 },
+    guards: [],
+    cameras: [],
+    loot: [],
+    keycard: null,
+    safe: null,
+    exitOpen: false,
+    score: 0,
+    totalScore: 0,
+    timeLeft: LEVEL_TIME,
+    time: 0,
+    alarm: 0,
+    peakAlarm: 0,
+    spottedCountdown: 0,
+    empCharges: EMP.chargesPerLevel,
+    empUntil: -1,
+    status: 'playing',
+    caughtReason: '',
+    levelScore: 0,
+    levelBonus: 0,
+    lootPoints: 0,
+    safePoints: 0,
+    sections: [0, 0, 0],
+    plateFlash: 0,
+    laserFlash: 0,
+  };
+
+  function startLevel(index) {
+    const level = LEVELS[index];
+    state.levelIndex = index;
+    state.level = level;
+    state.thief = { x: level.start.x, y: level.start.y, angle: -Math.PI / 2 };
+    state.guards = level.guards.map((g) => ({
+      x: g.waypoints[0].x,
+      y: g.waypoints[0].y,
+      waypoints: g.waypoints,
+      speed: g.speed,
+      wait: g.wait,
+      target: 1,
+      waiting: 0,
+      angle: 0,
+    }));
+    state.cameras = level.cameras.map((c) => ({ ...c, angle: c.baseAngle }));
+    state.loot = level.loot.map((l) => ({ ...l, taken: false }));
+    state.keycard = { ...level.keycard, taken: false };
+    state.safe = { ...level.safe, cracked: 0 };
+    state.exitOpen = false;
+    state.score = 0;
+    state.timeLeft = LEVEL_TIME;
+    state.time = 0;
+    state.alarm = 0;
+    state.peakAlarm = 0;
+    state.spottedCountdown = 0;
+    state.empCharges = EMP.chargesPerLevel;
+    state.empUntil = -1;
+    state.status = 'playing';
+    state.caughtReason = '';
+    state.levelScore = 0;
+    state.levelBonus = 0;
+    state.lootPoints = 0;
+    state.safePoints = 0;
+    state.sections = [0, 0, 0];
+    state.plateFlash = 0;
+    state.laserFlash = 0;
+    for (const p of state.level.plates) p.cool = 0;
+    for (const l of state.level.lasers) l.tripped = 0;
+  }
+
+  function reset() {
+    state.totalScore = 0;
+    startLevel(0);
+  }
+
+  function guardSees(guard) {
+    const dx = state.thief.x - guard.x;
+    const dy = state.thief.y - guard.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > CONE.guardRange) return false;
+    if (angleDiff(Math.atan2(dy, dx), guard.angle) > CONE.halfAngle) return false;
+    return !lineBlocked(guard.x, guard.y, state.thief.x, state.thief.y, state.level.walls);
+  }
+
+  function cameraSees(camera) {
+    if (state.time < state.empUntil) return false;
+    const dx = state.thief.x - camera.x;
+    const dy = state.thief.y - camera.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist > CONE.cameraRange) return false;
+    if (angleDiff(Math.atan2(dy, dx), camera.angle) > CONE.halfAngle) return false;
+    return !lineBlocked(camera.x, camera.y, state.thief.x, state.thief.y, state.level.walls);
+  }
+
+  function laserOn(laser) {
+    if (state.time < state.empUntil) return false;
+    return (state.time + laser.phase) % laser.period < laser.onTime;
+  }
+
+  function finishLevel() {
+    const lootTotal = state.level.loot.reduce((s, l) => s + LOOT_POINTS[l.kind], 0);
+    state.sections = [
+      Math.round((100 * state.lootPoints) / Math.max(1, lootTotal)),
+      Math.round(100 - state.peakAlarm),
+      Math.round((100 * state.safePoints) / SAFE.points),
+    ];
+    state.levelBonus = Math.round(state.timeLeft) * 2 + 50;
+    state.levelScore = state.score + state.levelBonus;
+    state.totalScore += state.levelScore;
+    if (state.levelIndex + 1 >= LEVELS.length) {
+      state.status = 'won';
+      return EVENT_WON;
+    }
+    state.status = 'levelDone';
+    return EVENT_LEVEL_DONE;
+  }
+
+  function caught(reason) {
+    state.status = 'caught';
+    state.caughtReason = reason;
+    return EVENT_CAUGHT;
+  }
+
+  /** Advance one fixed step. `move` is a normalised {x,y} vector or null. */
+  function step(dt, move, useEmp) {
+    if (state.status !== 'playing') return EVENT_NONE;
+    let events = EVENT_NONE;
+    state.time += dt;
+    state.timeLeft -= dt;
+    if (state.timeLeft <= 0) {
+      state.timeLeft = 0;
+      state.status = 'timeout';
+      return EVENT_TIMEOUT;
+    }
+    if (state.plateFlash > 0) state.plateFlash -= dt;
+    if (state.laserFlash > 0) state.laserFlash -= dt;
+
+    if (useEmp && state.empCharges > 0 && state.time >= state.empUntil) {
+      state.empCharges -= 1;
+      state.empUntil = state.time + EMP.disableSeconds;
+      state.score = Math.max(0, state.score - EMP.cost);
+      events |= EVENT_EMP;
+    }
+
+    // Thief movement + wall collision.
+    if (move) {
+      const next = moveCircle(state, state.thief.x, state.thief.y, move.x * THIEF.speed * dt, move.y * THIEF.speed * dt);
+      if (Math.hypot(move.x, move.y) > 0.01) state.thief.angle = Math.atan2(move.y, move.x);
+      state.thief.x = next.x;
+      state.thief.y = next.y;
+    }
+
+    // Guards patrol their routes, pausing at each waypoint.
+    for (const guard of state.guards) {
+      const target = guard.waypoints[guard.target];
+      if (guard.waiting > 0) {
+        guard.waiting -= dt;
+        continue;
+      }
+      const dx = target.x - guard.x;
+      const dy = target.y - guard.y;
+      const dist = Math.hypot(dx, dy);
+      const stepLen = guard.speed * dt;
+      if (dist <= stepLen) {
+        guard.x = target.x;
+        guard.y = target.y;
+        guard.waiting = guard.wait;
+        guard.target = guard.target + 1 >= guard.waypoints.length ? 0 : guard.target + 1;
+      } else {
+        guard.x += (dx / dist) * stepLen;
+        guard.y += (dy / dist) * stepLen;
+        guard.angle = Math.atan2(dy, dx);
+      }
+    }
+
+    // Cameras sweep.
+    for (const camera of state.cameras) {
+      camera.angle = camera.baseAngle + Math.sin(state.time * camera.speed) * camera.sweep;
+    }
+
+    // Detection: guards and cameras.
+    let seen = false;
+    let seenByCamera = false;
+    for (const guard of state.guards) {
+      if (Math.hypot(state.thief.x - guard.x, state.thief.y - guard.y) < GUARD.closeRange) {
+        return caught('A guard grabbed you at close range.');
+      }
+      if (guardSees(guard)) seen = true;
+    }
+    for (const camera of state.cameras) {
+      if (cameraSees(camera)) {
+        seen = true;
+        seenByCamera = true;
+      }
+    }
+    if (seen) {
+      state.alarm += (seenByCamera ? ALARM.cameraRisePerSecond : ALARM.risePerSecond) * dt;
+    } else {
+      state.alarm -= ALARM.decayPerSecond * dt;
+    }
+    state.alarm = clamp(state.alarm, 0, 100);
+    state.peakAlarm = Math.max(state.peakAlarm, state.alarm);
+
+    if (state.alarm >= ALARM.spottedAt && state.spottedCountdown <= 0) {
+      state.spottedCountdown = ALARM.countdownSeconds;
+    }
+    if (state.spottedCountdown > 0) {
+      if (!seen) {
+        state.spottedCountdown = 0;
+        state.alarm = 60;
+      } else {
+        state.spottedCountdown -= dt;
+        if (state.spottedCountdown <= 0) {
+          return caught('Spotted — the alarm countdown ran out.');
+        }
+      }
+    }
+
+    // Lasers: crossing a live beam trips the alarm hard (75%), but it is
+    // not an instant full alarm: one more exposure still spots the thief.
+    for (const laser of state.level.lasers) {
+      if (laser.tripped > 0) laser.tripped -= dt;
+      if (laserOn(laser) && laser.tripped <= 0) {
+        const d = pointSegmentDistance(state.thief.x, state.thief.y, laser.x1, laser.y1, laser.x2, laser.y2);
+        if (d < THIEF.radius + 2) {
+          laser.tripped = 2;
+          state.laserFlash = 0.8;
+          state.alarm = Math.max(state.alarm, 75);
+        }
+      }
+    }
+
+    // Pressure plates.
+    for (const plate of state.level.plates) {
+      if (plate.cool > 0) plate.cool -= dt;
+      if (
+        plate.cool <= 0 &&
+        state.thief.x > plate.x - 6 && state.thief.x < plate.x + plate.w + 6 &&
+        state.thief.y > plate.y - 6 && state.thief.y < plate.y + plate.h + 6
+      ) {
+        plate.cool = 3;
+        plate.flash = 0.8;
+        state.plateFlash = 0.8;
+        state.alarm = clamp(state.alarm + ALARM.plateHit, 0, 100);
+        if (state.alarm >= ALARM.spottedAt && state.spottedCountdown <= 0) {
+          state.spottedCountdown = ALARM.countdownSeconds;
+        }
+      }
+      if (plate.flash > 0) plate.flash -= dt;
+    }
+
+    // Keycard.
+    if (!state.keycard.taken && Math.hypot(state.thief.x - state.keycard.x, state.thief.y - state.keycard.y) < 26) {
+      state.keycard.taken = true;
+      events |= EVENT_KEYCARD;
+    }
+
+    // Loot.
+    for (const item of state.loot) {
+      if (!item.taken && Math.hypot(state.thief.x - item.x, state.thief.y - item.y) < 26) {
+        item.taken = true;
+        const pts = LOOT_POINTS[item.kind];
+        state.score += pts;
+        state.lootPoints += pts;
+        events |= EVENT_LOOT;
+      }
+    }
+
+    // Safe: stand close with the keycard to crack it. Every quarter cracked
+    // pays 15 points; the exit opens once half the safe is cracked.
+    const safe = state.safe;
+    const nearSafe =
+      state.thief.x > safe.x - 34 && state.thief.x < safe.x + safe.w + 34 &&
+      state.thief.y > safe.y - 34 && state.thief.y < safe.y + safe.h + 34;
+    if (nearSafe && state.keycard.taken && safe.cracked < 1) {
+      const before = Math.floor(safe.cracked * 4);
+      safe.cracked = Math.min(1, safe.cracked + dt / SAFE.crackSeconds);
+      const after = Math.floor(safe.cracked * 4);
+      if (after > before) {
+        state.score += 15;
+        state.safePoints += 15;
+        events |= EVENT_SAFE_TICK;
+      }
+      if (!state.exitOpen && safe.cracked >= SAFE.openAt) state.exitOpen = true;
+    }
+
+    // Exit.
+    const exit = state.level.exit;
+    if (
+      state.exitOpen &&
+      state.thief.x > exit.x && state.thief.x < exit.x + exit.w &&
+      state.thief.y > exit.y && state.thief.y < exit.y + exit.h
+    ) {
+      return finishLevel();
+    }
+
+    return events;
+  }
+
+  function nextLevel() {
+    startLevel(state.levelIndex + 1);
+  }
+
+  reset();
+
+  return {
+    state,
+    reset,
+    startLevel,
+    nextLevel,
+    step,
+    laserOn,
+    guardSees,
+    cameraSees,
+    levelTotalPoints: () => levelTotalPoints(state.level),
+  };
+}
+
+// ---- render.js ----
+// Midnight Vault — all drawing. Every pixel is drawn in code: floor,
+// walls, vision cones, guards, cameras, lasers, loot, the safe and the
+// HUD. No image, font or sound is loaded from anywhere.
+
+const SCREEN_TITLE = 0;
+const SCREEN_PLAY = 1;
+const SCREEN_PAUSED = 2;
+const SCREEN_LEVEL_DONE = 3;
+const SCREEN_WON = 4;
+const SCREEN_CAUGHT = 5;
+const SCREEN_TIMEOUT = 6;
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawCone(ctx, x, y, angle, range, halfAngle, fill, edge) {
+  const grad = ctx.createRadialGradient(x, y, 8, x, y, range);
+  grad.addColorStop(0, fill);
+  grad.addColorStop(1, 'rgba(255, 64, 64, 0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.arc(x, y, range, angle - halfAngle, angle + halfAngle);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = edge;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + Math.cos(angle - halfAngle) * range, y + Math.sin(angle - halfAngle) * range);
+  ctx.moveTo(x, y);
+  ctx.lineTo(x + Math.cos(angle + halfAngle) * range, y + Math.sin(angle + halfAngle) * range);
+  ctx.stroke();
+}
+
+function drawLoot(ctx, item, time) {
+  const bob = Math.sin(time * 3 + item.x) * 2;
+  const y = item.y + bob;
+  ctx.save();
+  ctx.translate(item.x, y);
+  if (item.kind === 'gold') {
+    ctx.fillStyle = PALETTE.goldDark;
+    ctx.fillRect(-11, -6, 22, 12);
+    ctx.fillStyle = PALETTE.gold;
+    ctx.fillRect(-9, -8, 18, 10);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillRect(-7, -7, 14, 3);
+  } else if (item.kind === 'gem') {
+    ctx.fillStyle = PALETTE.gem;
+    ctx.beginPath();
+    ctx.moveTo(0, -11);
+    ctx.lineTo(9, 0);
+    ctx.lineTo(0, 11);
+    ctx.lineTo(-9, 0);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.beginPath();
+    ctx.moveTo(0, -6);
+    ctx.lineTo(4, 0);
+    ctx.lineTo(0, 6);
+    ctx.lineTo(-4, 0);
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    ctx.fillStyle = '#1e7a44';
+    ctx.fillRect(-11, -7, 22, 14);
+    ctx.fillStyle = PALETTE.cash;
+    ctx.fillRect(-9, -5, 18, 10);
+    ctx.fillStyle = '#eef1f5';
+    ctx.beginPath();
+    ctx.arc(0, 0, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawGuard(ctx, guard, time) {
+  const pulse = 0.5 + 0.5 * Math.sin(time * 4);
+  ctx.save();
+  ctx.translate(guard.x, guard.y);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(0, 5, GUARD.radius, GUARD.radius * 0.55, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.guard;
+  ctx.beginPath();
+  ctx.arc(0, 0, GUARD.radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#7ea4e0';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  // Visor facing the patrol direction.
+  ctx.rotate(guard.angle);
+  ctx.fillStyle = PALETTE.guardVisor;
+  ctx.beginPath();
+  ctx.arc(5, 0, 6, -1.1, 1.1);
+  ctx.fill();
+  ctx.fillStyle = `rgba(255, 220, 120, ${0.5 + pulse * 0.5})`;
+  ctx.fillRect(GUARD.radius - 2, -3, 10, 6);
+  ctx.restore();
+}
+
+function drawThief(ctx, thief, time) {
+  const bob = Math.sin(time * 6) * 1.5;
+  ctx.save();
+  ctx.translate(thief.x, thief.y + bob * 0.3);
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.ellipse(0, 6, THIEF.radius, THIEF.radius * 0.55, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = PALETTE.thief;
+  ctx.beginPath();
+  ctx.arc(0, 0, THIEF.radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = PALETTE.thiefTrim;
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+  ctx.rotate(thief.angle);
+  ctx.fillStyle = PALETTE.thiefTrim;
+  ctx.beginPath();
+  ctx.moveTo(THIEF.radius - 1, 0);
+  ctx.lineTo(2, -5);
+  ctx.lineTo(2, 5);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPanel(ctx, x, y, w, h) {
+  ctx.fillStyle = 'rgba(10, 13, 24, 0.92)';
+  roundRect(ctx, x, y, w, h, 14);
+  ctx.fill();
+  ctx.strokeStyle = PALETTE.wallGold;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function centerText(ctx, text, x, y, font, color) {
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x, y);
+}
+
+function createRenderer(canvas) {
+  const ctx = canvas.getContext('2d');
+
+  function drawHud(state, time) {
+    const s = state;
+    ctx.fillStyle = PALETTE.hud;
+    ctx.fillRect(0, 0, FIELD.width, FIELD.hud);
+    ctx.fillStyle = PALETTE.hudLine;
+    ctx.fillRect(0, FIELD.hud - 2, FIELD.width, 2);
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.font = `700 20px ${FONT}`;
+    ctx.fillStyle = PALETTE.gold;
+    ctx.fillText('MIDNIGHT VAULT', 16, 24);
+    ctx.font = `12px ${FONT}`;
+    ctx.fillStyle = PALETTE.muted;
+    ctx.fillText(s.level.name, 16, 46);
+    // Score and timer (after a level ends the total already holds the
+    // level score, so show the total alone then).
+    ctx.font = `700 22px ${FONT}`;
+    ctx.fillStyle = PALETTE.text;
+    ctx.textAlign = 'center';
+    const shownScore = s.status === 'playing' ? s.totalScore + s.score : s.totalScore;
+    ctx.fillText(`SCORE ${shownScore}`, 330, 26);
+    const t = Math.max(0, Math.ceil(s.timeLeft));
+    const mm = String(Math.floor(t / 60));
+    const ss = String(t % 60).padStart(2, '0');
+    ctx.fillStyle = t <= 20 ? PALETTE.danger : PALETTE.text;
+    ctx.fillText(`${mm}:${ss}`, 330, 50);
+    // Alarm meter.
+    ctx.textAlign = 'left';
+    ctx.font = `700 11px ${FONT}`;
+    ctx.fillStyle = s.alarm >= 70 ? PALETTE.danger : PALETTE.muted;
+    ctx.fillText('ALARM', 470, 16);
+    ctx.fillStyle = '#0a0d18';
+    roundRect(ctx, 470, 24, 170, 16, 8);
+    ctx.fill();
+    const alarmW = (170 * s.alarm) / 100;
+    ctx.fillStyle = s.alarm >= 70 ? PALETTE.danger : s.alarm >= 40 ? '#ff9f2e' : '#2ecc71';
+    if (alarmW > 0) {
+      roundRect(ctx, 470, 24, Math.max(8, alarmW), 16, 8);
+      ctx.fill();
+    }
+    ctx.strokeStyle = PALETTE.hudLine;
+    ctx.lineWidth = 1;
+    roundRect(ctx, 470, 24, 170, 16, 8);
+    ctx.stroke();
+    ctx.font = `12px ${FONT}`;
+    ctx.fillStyle = PALETTE.text;
+    ctx.fillText(`${Math.round(s.alarm)}%`, 646, 32);
+    ctx.fillStyle = PALETTE.muted;
+    ctx.fillText(s.spottedCountdown > 0 ? `SPOTTED ${s.spottedCountdown.toFixed(1)}s` : 'HIDDEN', 470, 52);
+    // Loot, keycard, EMP, exit.
+    const lootTotal = s.level.loot.length;
+    const lootGot = s.loot.filter((l) => l.taken).length;
+    ctx.textAlign = 'right';
+    ctx.font = `700 14px ${FONT}`;
+    ctx.fillStyle = PALETTE.gold;
+    ctx.fillText(`LOOT ${lootGot}/${lootTotal}`, 944, 22);
+    ctx.fillStyle = s.keycard.taken ? PALETTE.keycard : PALETTE.muted;
+    ctx.fillText(s.keycard.taken ? 'KEYCARD ✓' : 'KEYCARD —', 944, 42);
+    ctx.fillStyle = s.empCharges > 0 ? PALETTE.text : PALETTE.muted;
+    ctx.font = `12px ${FONT}`;
+    ctx.fillText(`EMP [E] ×${s.empCharges}${s.time < s.empUntil ? ' ACTIVE' : ''}`, 800, 52);
+    ctx.fillStyle = s.exitOpen ? PALETTE.ok : PALETTE.danger;
+    ctx.fillText(s.exitOpen ? 'EXIT OPEN' : 'EXIT LOCKED', 944, 52);
+    void time;
+  }
+
+  function drawField(state, time) {
+    const s = state;
+    const level = s.level;
+    ctx.save();
+    ctx.translate(0, FIELD.hud);
+    // Floor tiles.
+    const tile = 48;
+    for (let y = 0; y < FIELD.height; y += tile) {
+      for (let x = 0; x < FIELD.width; x += tile) {
+        ctx.fillStyle = ((x + y) / tile) % 2 === 0 ? PALETTE.floorA : PALETTE.floorB;
+        ctx.fillRect(x, y, tile, tile);
+      }
+    }
+    // Carpet runner down the middle hall.
+    ctx.fillStyle = PALETTE.carpet;
+    ctx.fillRect(330, 0, 280, FIELD.height);
+    ctx.strokeStyle = 'rgba(201,162,39,0.35)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(336, 6, 268, FIELD.height - 12);
+    // Room labels.
+    ctx.font = `700 13px ${FONT}`;
+    ctx.fillStyle = 'rgba(238,241,245,0.28)';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(level.name, 28, 44);
+    // Pressure plates.
+    for (const plate of level.plates) {
+      const hot = (plate.flash || 0) > 0;
+      ctx.fillStyle = hot ? PALETTE.plateHot : PALETTE.plate;
+      ctx.fillRect(plate.x, plate.y, plate.w, plate.h);
+      ctx.strokeStyle = hot ? '#ff8a96' : '#6b5578';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(plate.x + 2, plate.y + 2, plate.w - 4, plate.h - 4);
+      ctx.fillStyle = 'rgba(238,241,245,0.5)';
+      ctx.font = `10px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('PRESSURE', plate.x + plate.w / 2, plate.y + plate.h / 2 + 3);
+    }
+    // Exit door.
+    const exit = level.exit;
+    ctx.fillStyle = s.exitOpen ? PALETTE.exitOpen : PALETTE.exitClosed;
+    ctx.fillRect(exit.x - 4, exit.y - 4, exit.w + 8, exit.h + 8);
+    ctx.fillStyle = '#0b0e16';
+    ctx.fillRect(exit.x, exit.y, exit.w, exit.h);
+    ctx.fillStyle = s.exitOpen ? '#baffd6' : '#ffb3ab';
+    ctx.font = `700 15px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('EXIT', exit.x + exit.w / 2, exit.y + exit.h / 2 + 5);
+    if (s.exitOpen) {
+      const pulse = 0.5 + 0.5 * Math.sin(time * 5);
+      ctx.strokeStyle = `rgba(46, 204, 113, ${0.4 + pulse * 0.6})`;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(exit.x - 10, exit.y - 10, exit.w + 20, exit.h + 20);
+      ctx.fillStyle = PALETTE.ok;
+      ctx.font = `700 12px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('▼ GETAWAY ▼', Math.max(80, Math.min(880, exit.x + exit.w / 2)), exit.y - 16);
+    } else {
+      ctx.fillStyle = PALETTE.muted;
+      ctx.font = `11px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('crack the safe past 50%', Math.max(100, Math.min(860, exit.x + exit.w / 2)), exit.y - 16);
+    }
+    // Safe.
+    const safe = s.safe;
+    ctx.fillStyle = PALETTE.safeDark;
+    ctx.fillRect(safe.x - 4, safe.y - 4, safe.w + 8, safe.h + 8);
+    ctx.fillStyle = PALETTE.safe;
+    ctx.fillRect(safe.x, safe.y, safe.w, safe.h);
+    ctx.strokeStyle = PALETTE.wallGold;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(safe.x, safe.y, safe.w, safe.h);
+    ctx.fillStyle = '#dfe8ff';
+    ctx.beginPath();
+    ctx.arc(safe.x + safe.w / 2, safe.y + safe.h / 2, 13, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#2f3547';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(safe.x + safe.w / 2, safe.y + safe.h / 2, 13, -Math.PI / 2, -Math.PI / 2 + safe.cracked * Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = PALETTE.text;
+    ctx.font = `700 11px ${FONT}`;
+    ctx.fillText('SAFE', safe.x + safe.w / 2, safe.y + safe.h - 8);
+    if (safe.cracked > 0 && safe.cracked < 1) {
+      ctx.fillStyle = PALETTE.gold;
+      ctx.font = `700 12px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText(`CRACKING ${Math.round(safe.cracked * 100)}%`, Math.max(70, Math.min(890, safe.x + safe.w / 2)), safe.y - 10);
+    }
+    // Keycard.
+    if (!s.keycard.taken) {
+      const glow = 0.5 + 0.5 * Math.sin(time * 4);
+      ctx.fillStyle = `rgba(77, 216, 255, ${0.25 + glow * 0.3})`;
+      ctx.beginPath();
+      ctx.arc(s.keycard.x, s.keycard.y, 20, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = PALETTE.keycard;
+      roundRect(ctx, s.keycard.x - 11, s.keycard.y - 7, 22, 14, 3);
+      ctx.fill();
+      ctx.fillStyle = '#0b0e16';
+      ctx.fillRect(s.keycard.x - 7, s.keycard.y - 4, 14, 3);
+    }
+    // Loot.
+    for (const item of s.loot) {
+      if (!item.taken) drawLoot(ctx, item, time);
+    }
+    // Vision cones (guards red, cameras amber), drawn before walls so walls cut them.
+    for (const guard of s.guards) {
+      drawCone(ctx, guard.x, guard.y, guard.angle, CONE.guardRange, CONE.halfAngle, PALETTE.cone, PALETTE.coneEdge);
+    }
+    for (const camera of s.cameras) {
+      if (s.time < s.empUntil) continue;
+      drawCone(ctx, camera.x, camera.y, camera.angle, CONE.cameraRange, CONE.halfAngle, PALETTE.cameraCone, PALETTE.cameraConeEdge);
+    }
+    // Lasers.
+    for (const laser of level.lasers) {
+      const on = s.time < s.empUntil ? false : ((s.time + laser.phase) % laser.period < laser.onTime);
+      ctx.strokeStyle = on ? PALETTE.laser : PALETTE.laserOff;
+      ctx.lineWidth = on ? 4 : 2;
+      ctx.beginPath();
+      ctx.moveTo(laser.x1, laser.y1);
+      ctx.lineTo(laser.x2, laser.y2);
+      ctx.stroke();
+      if (on) {
+        ctx.fillStyle = '#ff8a96';
+        ctx.beginPath();
+        ctx.arc(laser.x1, laser.y1, 6, 0, Math.PI * 2);
+        ctx.arc(laser.x2, laser.y2, 6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.fillStyle = '#3a4266';
+      ctx.fillRect(laser.x1 - 6, laser.y1 - 6, 12, 12);
+      ctx.fillRect(laser.x2 - 6, laser.y2 - 6, 12, 12);
+    }
+    // Walls.
+    for (const w of level.walls) {
+      ctx.fillStyle = PALETTE.wall;
+      ctx.fillRect(w.x, w.y, w.w, w.h);
+      ctx.fillStyle = PALETTE.wallTop;
+      ctx.fillRect(w.x, w.y, w.w, 4);
+      ctx.fillStyle = 'rgba(201,162,39,0.5)';
+      ctx.fillRect(w.x, w.y + w.h - 2, w.w, 2);
+    }
+    // Cameras (bodies on the wall).
+    for (const camera of s.cameras) {
+      ctx.save();
+      ctx.translate(camera.x, camera.y);
+      ctx.rotate(camera.angle);
+      ctx.fillStyle = s.time < s.empUntil ? '#555' : '#e8b64c';
+      roundRect(ctx, -4, -7, 18, 14, 4);
+      ctx.fill();
+      ctx.fillStyle = '#0b0e16';
+      ctx.beginPath();
+      ctx.arc(14, 0, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    // Guards and thief.
+    for (const guard of s.guards) drawGuard(ctx, guard, time);
+    drawThief(ctx, s.thief, time);
+    // EMP bubble.
+    if (s.time < s.empUntil) {
+      ctx.strokeStyle = 'rgba(77, 216, 255, 0.7)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([8, 6]);
+      ctx.beginPath();
+      ctx.arc(s.thief.x, s.thief.y, 52, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = PALETTE.keycard;
+      ctx.font = `700 12px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('EMP ACTIVE — cameras & lasers down', s.thief.x, s.thief.y - 34);
+    }
+    // Safe hint.
+    if (!s.keycard.taken) {
+      ctx.fillStyle = 'rgba(238,241,245,0.75)';
+      ctx.font = `12px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('Find the keycard, then crack the safe', FIELD.width / 2, FIELD.height - 12);
+    } else if (!s.exitOpen) {
+      ctx.fillStyle = 'rgba(238,241,245,0.75)';
+      ctx.font = `12px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.fillText('Stand by the safe to crack it — exit opens past 50%', FIELD.width / 2, FIELD.height - 12);
+    }
+    ctx.restore();
+  }
+
+  function drawSpotted(state) {
+    if (state.spottedCountdown <= 0) return;
+    const flash = 0.35 + 0.3 * Math.sin(performance.now() / 90);
+    ctx.fillStyle = `rgba(255, 40, 60, ${flash * 0.35})`;
+    ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+    ctx.strokeStyle = PALETTE.danger;
+    ctx.lineWidth = 6;
+    ctx.strokeRect(3, 3, CANVAS.width - 6, CANVAS.height - 6);
+    centerText(ctx, `SPOTTED!  ${state.spottedCountdown.toFixed(1)}s — BREAK LINE OF SIGHT!`, CANVAS.width / 2, 108, `700 26px ${FONT}`, '#ffffff');
+  }
+
+  function draw(state, screen, best) {
+    const time = state.time;
+    ctx.fillStyle = PALETTE.backdrop;
+    ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+    const scale = Math.min(canvas.width / CANVAS.width, canvas.height / CANVAS.height);
+    ctx.save();
+    ctx.scale(scale, scale);
+    drawField(state, time);
+    drawHud(state, time);
+    drawSpotted(state);
+    if (screen === SCREEN_TITLE) {
+      ctx.fillStyle = 'rgba(8, 10, 20, 0.72)';
+      ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+      drawPanel(ctx, 180, 92, 600, 480);
+      centerText(ctx, 'MIDNIGHT VAULT', 480, 140, `700 44px ${FONT}`, PALETTE.gold);
+      centerText(ctx, '— THE MERIDIAN HEIST —', 480, 176, `700 16px ${FONT}`, PALETTE.text);
+      centerText(ctx, 'Slip past the guards. Crack the safe. Get out rich.', 480, 206, `15px ${FONT}`, PALETTE.muted);
+      const lines = [
+        'MOVE  WASD / arrows — or click the floor to walk there',
+        'STEAL  Grab loot, the keycard, then hold by the safe to crack it',
+        'EXIT  opens once the safe is cracked past 50%',
+        'HIDE  Stay out of red guard cones and amber camera cones',
+        'DANGER  Lasers and pressure plates trip the alarm',
+        'TOOL  Press E for an EMP (costs 20 pts) — kills cameras & lasers 6s',
+        'CLOCK  120 seconds per level · 2 levels · break sight to cool down',
+      ];
+      ctx.font = `14px ${FONT}`;
+      ctx.fillStyle = PALETTE.text;
+      ctx.textAlign = 'left';
+      lines.forEach((line, i) => ctx.fillText(line, 215, 246 + i * 28));
+      centerText(ctx, '▶  PRESS SPACE OR CLICK TO START  ◀', 480, 478, `700 18px ${FONT}`, PALETTE.ok);
+      if (best > 0) centerText(ctx, `Best score: ${best}`, 480, 512, `14px ${FONT}`, PALETTE.muted);
+      centerText(ctx, 'No sound needed · works offline · original art, drawn in code', 480, 544, `12px ${FONT}`, PALETTE.muted);
+    } else if (screen === SCREEN_PAUSED) {
+      ctx.fillStyle = 'rgba(8, 10, 20, 0.7)';
+      ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+      centerText(ctx, 'PAUSED', 480, 300, `700 44px ${FONT}`, PALETTE.text);
+      centerText(ctx, 'Press P or click to keep stealing', 480, 344, `16px ${FONT}`, PALETTE.muted);
+    } else if (screen === SCREEN_LEVEL_DONE) {
+      ctx.fillStyle = 'rgba(8, 10, 20, 0.72)';
+      ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+      drawPanel(ctx, 230, 150, 500, 360);
+      centerText(ctx, 'LEVEL CLEARED!', 480, 196, `700 34px ${FONT}`, PALETTE.ok);
+      centerText(ctx, `${state.level.name} — score ${state.levelScore} (bonus +${state.levelBonus})`, 480, 232, `15px ${FONT}`, PALETTE.text);
+      const names = ['ROUTES — loot on the patrol routes', 'ALARM — stayed unseen', 'SAFE — cracked for loot'];
+      state.sections.forEach((value, i) => {
+        centerText(ctx, `${names[i]}: ${value} / 100`, 480, 276 + i * 30, `700 16px ${FONT}`, PALETTE.text);
+      });
+      centerText(ctx, `TOTAL ${state.totalScore}`, 480, 386, `700 22px ${FONT}`, PALETTE.gold);
+      centerText(ctx, '▶  PRESS SPACE FOR THE NEXT LEVEL  ◀', 480, 436, `700 16px ${FONT}`, PALETTE.ok);
+      centerText(ctx, 'The vault floor is harder: three guards, two cameras.', 480, 470, `13px ${FONT}`, PALETTE.muted);
+    } else if (screen === SCREEN_WON) {
+      ctx.fillStyle = 'rgba(8, 10, 20, 0.78)';
+      ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+      drawPanel(ctx, 200, 130, 560, 400);
+      centerText(ctx, '★ THE GETAWAY ★', 480, 182, `700 38px ${FONT}`, PALETTE.gold);
+      centerText(ctx, 'Both vaults cracked. The crew is out, the loot is yours.', 480, 220, `16px ${FONT}`, PALETTE.text);
+      centerText(ctx, `TOTAL SCORE  ${state.totalScore}`, 480, 272, `700 28px ${FONT}`, PALETTE.text);
+      centerText(ctx, `Best score: ${Math.max(best, state.totalScore)}`, 480, 312, `15px ${FONT}`, PALETTE.muted);
+      const names = ['ROUTES', 'ALARM', 'SAFE'];
+      state.sections.forEach((value, i) => {
+        centerText(ctx, `${names[i]} ${value} / 100`, 480, 344 + i * 26, `15px ${FONT}`, PALETTE.text);
+      });
+      centerText(ctx, '▶  PRESS SPACE TO STEAL AGAIN  ◀', 480, 448, `700 16px ${FONT}`, PALETTE.ok);
+      centerText(ctx, 'Midnight Vault — an original heist, drawn in code', 480, 490, `12px ${FONT}`, PALETTE.muted);
+    } else if (screen === SCREEN_CAUGHT) {
+      ctx.fillStyle = 'rgba(40, 6, 12, 0.78)';
+      ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+      drawPanel(ctx, 230, 170, 500, 320);
+      centerText(ctx, 'CAUGHT!', 480, 222, `700 40px ${FONT}`, PALETTE.danger);
+      centerText(ctx, state.caughtReason, 480, 262, `15px ${FONT}`, PALETTE.text);
+      centerText(ctx, `Score ${state.totalScore + state.score} · ${state.level.name}`, 480, 300, `15px ${FONT}`, PALETTE.muted);
+      centerText(ctx, 'Watch the cones sweep before you move.', 480, 330, `13px ${FONT}`, PALETTE.muted);
+      centerText(ctx, '▶  PRESS SPACE TO TRY AGAIN  ◀', 480, 392, `700 16px ${FONT}`, PALETTE.ok);
+      centerText(ctx, 'R — restart the level', 480, 428, `13px ${FONT}`, PALETTE.muted);
+    } else if (screen === SCREEN_TIMEOUT) {
+      ctx.fillStyle = 'rgba(8, 10, 20, 0.78)';
+      ctx.fillRect(0, 0, CANVAS.width, CANVAS.height);
+      drawPanel(ctx, 230, 170, 500, 320);
+      centerText(ctx, "TIME'S UP!", 480, 222, `700 40px ${FONT}`, PALETTE.danger);
+      centerText(ctx, 'The 120 seconds ran out before the getaway.', 480, 262, `15px ${FONT}`, PALETTE.text);
+      centerText(ctx, `Score ${state.totalScore + state.score} · ${state.level.name}`, 480, 300, `15px ${FONT}`, PALETTE.muted);
+      centerText(ctx, '▶  PRESS SPACE TO TRY AGAIN  ◀', 480, 392, `700 16px ${FONT}`, PALETTE.ok);
+    }
+    ctx.restore();
+  }
+
+  return { draw };
+}
+
+// ---- shots.js ----
+// Midnight Vault — the screenshot scenes behind ?shot=start|play|alarm|end.
+// Each one plays the real rules forward from a fresh world, steered by an
+// autopilot that reads cones, lasers and plates before it moves, so every
+// frame is what a real game looks like and the same seed always gives the
+// same frame. The alarm scene steers into a cone on purpose, to show the
+// alarm meter and the spotted countdown.
+
+const SAMPLE = STEP;
+const DIRS = [
+  { x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 },
+  { x: 0.707, y: 0.707 }, { x: -0.707, y: 0.707 }, { x: 0.707, y: -0.707 },
+  { x: -0.707, y: -0.707 }, { x: 0, y: 0 },
+];
+
+function hitsWall(state, x, y) {
+  for (const w of state.level.walls) {
+    const nx = Math.max(w.x, Math.min(x, w.x + w.w));
+    const ny = Math.max(w.y, Math.min(y, w.y + w.h));
+    if ((x - nx) * (x - nx) + (y - ny) * (y - ny) < THIEF.radius * THIEF.radius) return true;
+  }
+  return false;
+}
+
+function coneDanger(state, x, y) {
+  // 1 when standing in a guard or camera cone, 0.6 near a guard, else 0.
+  for (const guard of state.guards) {
+    const dx = x - guard.x;
+    const dy = y - guard.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < GUARD.closeRange + 12) return 1;
+    if (dist < CONE.guardRange) {
+      let d = Math.atan2(dy, dx) - guard.angle;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      if (Math.abs(d) < CONE.halfAngle && !lineBlocked(guard.x, guard.y, x, y, state.level.walls)) return 1;
+    }
+  }
+  for (const camera of state.cameras) {
+    if (state.time >= state.empUntil) {
+      const dx = x - camera.x;
+      const dy = y - camera.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < CONE.cameraRange) {
+        let d = Math.atan2(dy, dx) - camera.angle;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        if (Math.abs(d) < CONE.halfAngle && !lineBlocked(camera.x, camera.y, x, y, state.level.walls)) return 1;
+      }
+    }
+  }
+  for (const laser of state.level.lasers) {
+    // The beam blinks: it is dangerous only while it is on, so the thief
+    // may time the blink to cross — but the path planner (cellDanger)
+    // still prefers to route around the line's ends.
+    const on = state.time < state.empUntil ? false : (state.time + laser.phase) % laser.period < laser.onTime;
+    if (on && pointSegmentDistance(x, y, laser.x1, laser.y1, laser.x2, laser.y2) < THIEF.radius + 4) return 1;
+  }
+  for (const plate of state.level.plates) {
+    if (x > plate.x - 4 && x < plate.x + plate.w + 4 && y > plate.y - 4 && y < plate.y + plate.h + 4) return 0.8;
+  }
+  return 0;
+}
+
+/** True when (x, y) is inside a guard or camera vision cone (not lasers/plates). */
+function inVisionCone(state, x, y) {
+  for (const guard of state.guards) {
+    const dx = x - guard.x;
+    const dy = y - guard.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < CONE.guardRange) {
+      let d = Math.atan2(dy, dx) - guard.angle;
+      while (d > Math.PI) d -= Math.PI * 2;
+      while (d < -Math.PI) d += Math.PI * 2;
+      if (Math.abs(d) < CONE.halfAngle && !lineBlocked(guard.x, guard.y, x, y, state.level.walls)) return true;
+    }
+  }
+  for (const camera of state.cameras) {
+    if (state.time >= state.empUntil) {
+      const dx = x - camera.x;
+      const dy = y - camera.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < CONE.cameraRange) {
+        let d = Math.atan2(dy, dx) - camera.angle;
+        while (d > Math.PI) d -= Math.PI * 2;
+        while (d < -Math.PI) d += Math.PI * 2;
+        if (Math.abs(d) < CONE.halfAngle && !lineBlocked(camera.x, camera.y, x, y, state.level.walls)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Current objective: loot, then the keycard, then the safe, then the exit. */
+function objective(state) {
+  if (!state.keycard.taken) {
+    const near = state.loot.find((l) => !l.taken && Math.hypot(l.x - state.thief.x, l.y - state.thief.y) < 130);
+    if (near) return { x: near.x, y: near.y };
+    return { x: state.keycard.x, y: state.keycard.y };
+  }
+  const loot = state.loot.find((l) => !l.taken);
+  if (loot && state.safe.cracked < 0.5) return { x: loot.x, y: loot.y };
+  if (state.safe.cracked < 1) {
+    return { x: state.safe.x + state.safe.w / 2, y: state.safe.y + state.safe.h + 30 };
+  }
+  if (state.exitOpen) return { x: state.level.exit.x + 28, y: state.level.exit.y + 28 };
+  return { x: state.safe.x + state.safe.w / 2, y: state.safe.y + state.safe.h + 30 };
+}
+
+/** Pick the safest step toward the objective, or hold still if all are bad. */
+function autopilot(world, reckless) {
+  const state = world.state;
+  const target = reckless
+    ? (() => {
+        const g = state.guards[0];
+        return { x: g.x + Math.cos(g.angle) * 80, y: g.y + Math.sin(g.angle) * 80 };
+      })()
+    : objective(state);
+  if (reckless) return greedyStep(state, target, true);
+  // Caught in a guard or camera cone and the alarm is already rising
+  // (a cone swept onto us while we waited): run away from the nearest
+  // threat instead of pressing on toward the objective.
+  if (state.alarm > 20 && inVisionCone(state, state.thief.x, state.thief.y)) {
+    let threat = null;
+    let threatDist = Infinity;
+    for (const guard of state.guards) {
+      const d = Math.hypot(state.thief.x - guard.x, state.thief.y - guard.y);
+      if (d < threatDist) {
+        threatDist = d;
+        threat = guard;
+      }
+    }
+    for (const camera of state.cameras) {
+      const d = Math.hypot(state.thief.x - camera.x, state.thief.y - camera.y);
+      if (d < threatDist) {
+        threatDist = d;
+        threat = camera;
+      }
+    }
+    if (threat) {
+      const dx = state.thief.x - threat.x;
+      const dy = state.thief.y - threat.y;
+      const len = Math.hypot(dx, dy) || 1;
+      return greedyStep(state, { x: state.thief.x + (dx / len) * 140, y: state.thief.y + (dy / len) * 140 }, false);
+    }
+  }
+  const targetKey = `${state.levelIndex}:${Math.round(target.x)},${Math.round(target.y)}`;
+  cachedStep += 1;
+  if (!cachedPath || cachedTarget !== targetKey || cachedStep % 15 === 0) {
+    cachedPath = findPath(state, state.thief, target);
+    cachedTarget = targetKey;
+  }
+  if (cachedPath && cachedPath.length > 1) {
+    let next = cachedPath[1];
+    if (Math.hypot(next.x - state.thief.x, next.y - state.thief.y) < 14) {
+      cachedPath.shift();
+      next = cachedPath[1] ?? cachedPath[0];
+    }
+    // The next step is dangerous right now (a guard turned toward it):
+    // wait where we are instead of walking into the cone.
+    if (coneDanger(state, next.x, next.y) > 0 && coneDanger(state, state.thief.x, state.thief.y) === 0) {
+      return { x: 0, y: 0 };
+    }
+    const dx = next.x - state.thief.x;
+    const dy = next.y - state.thief.y;
+    const len = Math.hypot(dx, dy) || 1;
+    return { x: dx / len, y: dy / len };
+  }
+  // No path (target inside a wall margin): step greedily at the target.
+  return greedyStep(state, target);
+}
+
+function greedyStep(state, target, ignoreDanger) {
+  const dx = target.x - state.thief.x;
+  const dy = target.y - state.thief.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  // Short lookahead (0.12 s) so the thief can close the last few pixels
+  // onto a pickup, plus the exact desired direction as a candidate.
+  const dirs = [...DIRS, { x: dx / dist, y: dy / dist }];
+  let best = DIRS[DIRS.length - 1];
+  let bestCost = Infinity;
+  for (const dir of dirs) {
+    const nx = state.thief.x + dir.x * THIEF.speed * 0.12;
+    const ny = state.thief.y + dir.y * THIEF.speed * 0.12;
+    if (hitsWall(state, nx, ny)) continue;
+    const danger = ignoreDanger ? 0 : coneDanger(state, nx, ny);
+    const d = Math.hypot(target.x - nx, target.y - ny);
+    const cost = d + danger * 900 + (dir.x === 0 && dir.y === 0 ? 30 : 0);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = dir;
+    }
+  }
+  return best;
+}
+
+// --- Grid pathfinding: the autopilot plans a route around walls and
+// around danger, instead of walking straight at its target and getting
+// stuck in a guard's corridor. ---
+const CELL = 32;
+const COLS = 30;
+const ROWS = 19;
+
+function cellBlocked(state, cx, cy) {
+  return hitsWall(state, cx * CELL + CELL / 2, cy * CELL + CELL / 2);
+}
+
+function cellDanger(state, cx, cy) {
+  const x = cx * CELL + CELL / 2;
+  const y = cy * CELL + CELL / 2;
+  const now = coneDanger(state, x, y);
+  if (now > 0) return now;
+  // A laser line is always risky to plan across (it blinks): the path
+  // prefers to route around its ends, while the thief may still time a
+  // crossing when the beam is off.
+  for (const laser of state.level.lasers) {
+    if (pointSegmentDistance(x, y, laser.x1, laser.y1, laser.x2, laser.y2) < THIEF.radius + 4) return 0.9;
+  }
+  // A guard's whole patrol line is risky: it will be there soon, so the
+  // path prefers to cross it far from where the guard is now.
+  for (const guard of state.guards) {
+    for (let i = 0; i < guard.waypoints.length; i += 1) {
+      const a = guard.waypoints[i];
+      const b = guard.waypoints[(i + 1) % guard.waypoints.length];
+      if (pointSegmentDistance(x, y, a.x, a.y, b.x, b.y) < 42) return 0.5;
+    }
+  }
+  return 0;
+}
+
+function findPath(state, from, to) {
+  const sx = Math.max(0, Math.min(COLS - 1, Math.floor(from.x / CELL)));
+  const sy = Math.max(0, Math.min(ROWS - 1, Math.floor(from.y / CELL)));
+  const tx = Math.max(0, Math.min(COLS - 1, Math.floor(to.x / CELL)));
+  const ty = Math.max(0, Math.min(ROWS - 1, Math.floor(to.y / CELL)));
+  const key = (x, y) => y * COLS + x;
+  const open = [{ x: sx, y: sy, g: 0, f: 0, parent: null }];
+  const best = new Map([[key(sx, sy), 0]]);
+  const closed = new Set();
+  while (open.length > 0) {
+    let bi = 0;
+    for (let i = 1; i < open.length; i += 1) if (open[i].f < open[bi].f) bi = i;
+    const node = open.splice(bi, 1)[0];
+    if (node.x === tx && node.y === ty) {
+      const path = [];
+      let cur = node;
+      while (cur) {
+        path.unshift({ x: cur.x * CELL + CELL / 2, y: cur.y * CELL + CELL / 2 });
+        cur = cur.parent;
+      }
+      return path;
+    }
+    closed.add(key(node.x, node.y));
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+      const nx = node.x + dx;
+      const ny = node.y + dy;
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) continue;
+      if (closed.has(key(nx, ny))) continue;
+      if (cellBlocked(state, nx, ny)) continue;
+      const danger = cellDanger(state, nx, ny);
+      const stepCost = (dx !== 0 && dy !== 0 ? 1.4 : 1) + danger * 25;
+      const g = node.g + stepCost;
+      if (best.has(key(nx, ny)) && best.get(key(nx, ny)) <= g) continue;
+      best.set(key(nx, ny), g);
+      const h = Math.hypot(tx - nx, ty - ny);
+      open.push({ x: nx, y: ny, g, f: g + h, parent: node });
+    }
+  }
+  return null;
+}
+
+let cachedPath = null;
+let cachedTarget = '';
+let cachedStep = 0;
+
+function runFor(world, seconds, reckless) {
+  const steps = Math.round(seconds / SAMPLE);
+  for (let i = 0; i < steps; i += 1) {
+    const events = world.step(SAMPLE, autopilot(world, reckless), false);
+    if (world.state.status !== 'playing') return events;
+  }
+  return 0;
+}
+
+/**
+ * Set `world` to the named scene and return the screen to draw over it.
+ * start: mid-room, cones sweeping, loot and alarm visible. play: 24 s of
+ * real play. alarm: walked into a cone on purpose. end: played through
+ * both levels to the getaway.
+ */
+function stageShot(name, world) {
+  world.reset();
+  if (name === 'alarm') {
+    runFor(world, 4, false);
+    runFor(world, 3.5, true);
+    return { screen: SCREEN_PLAY, best: 0 };
+  }
+  if (name === 'play') {
+    runFor(world, 16, false);
+    const s = world.state;
+    return { screen: s.status === 'levelDone' ? SCREEN_LEVEL_DONE : s.status === 'won' ? SCREEN_WON : SCREEN_PLAY, best: s.totalScore + s.score };
+  }
+  if (name === 'end') {
+    for (let i = 0; i < 60 * 400; i += 1) {
+      world.step(SAMPLE, autopilot(world, false), false);
+      if (world.state.status === 'levelDone') world.nextLevel();
+      if (world.state.status === 'won' || world.state.status === 'caught' || world.state.status === 'timeout') break;
+    }
+    const s = world.state;
+    return { screen: s.status === 'won' ? SCREEN_WON : SCREEN_CAUGHT, best: s.totalScore };
+  }
+  // start (default)
+  runFor(world, 5, false);
+  return { screen: SCREEN_PLAY, best: 0 };
+}
+
+// ---- main.js ----
+// Midnight Vault — boot and the one loop. Input is read every frame, the
+// world advances in fixed 1/60 s steps, and the renderer paints what is
+// there. The game moves between title, play, paused, level-done, getaway
+// (won), caught and time-up screens.
+//
+// ?shot=start|play|alarm|end stages that scene instead of running the loop,
+// paints it twice and sets window.__shotReady for a screenshot.
+
+const MAX_FRAME = 0.25;
+
+const params = new URLSearchParams(window.location.search);
+const shot = params.get('shot');
+
+const canvas = document.getElementById('game');
+canvas.width = CANVAS.width;
+canvas.height = CANVAS.height;
+const status = document.getElementById('status');
+const world = createWorld();
+const renderer = createRenderer(canvas);
+
+function toLogical(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const x = ((clientX - rect.left) / rect.width) * CANVAS.width;
+  const y = ((clientY - rect.top) / rect.height) * CANVAS.height - FIELD.hud;
+  return { x: Math.max(0, Math.min(FIELD.width, x)), y: Math.max(0, Math.min(FIELD.height, y)) };
+}
+
+function readBest() {
+  try {
+    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveBest(value) {
+  try {
+    window.localStorage.setItem(BEST_KEY, String(value));
+  } catch {
+    // Storage can be off (private windows): the best score lasts this visit.
+  }
+}
+
+function runShot(name) {
+  const scene = stageShot(name, world);
+  let painted = 0;
+  function paint() {
+    renderer.draw(world.state, scene.screen, scene.best);
+    painted += 1;
+    if (painted < 2) requestAnimationFrame(paint);
+    else window.__shotReady = true;
+  }
+  requestAnimationFrame(paint);
+}
+
+function runGame() {
+  const input = createInput(canvas, toLogical);
+  let screen = SCREEN_TITLE;
+  let best = readBest();
+  let accumulator = 0;
+  let last = performance.now();
+
+  function announce(message) {
+    status.textContent = message;
+  }
+
+  function startGame() {
+    world.reset();
+    input.clearMoveTarget();
+    accumulator = 0;
+    screen = SCREEN_PLAY;
+    announce('Playing. Grab the keycard, crack the safe, get out.');
+  }
+
+  function endRun() {
+    const total = world.state.totalScore + world.state.score;
+    if (total > best) {
+      best = total;
+      saveBest(best);
+    }
+  }
+
+  function handleActions() {
+    const actions = input.takeActions();
+    if (actions & ACTION_CONFIRM) {
+      if (screen === SCREEN_TITLE) startGame();
+      else if (screen === SCREEN_LEVEL_DONE) {
+        world.nextLevel();
+        input.clearMoveTarget();
+        screen = SCREEN_PLAY;
+        announce(`${world.state.level.name}. Keep stealing.`);
+      } else if (screen === SCREEN_WON || screen === SCREEN_CAUGHT || screen === SCREEN_TIMEOUT) {
+        startGame();
+      } else if (screen === SCREEN_PAUSED) {
+        screen = SCREEN_PLAY;
+        announce('Playing.');
+      }
+    }
+    if (actions & ACTION_PAUSE) {
+      if (screen === SCREEN_PLAY) {
+        screen = SCREEN_PAUSED;
+        announce('Paused.');
+      } else if (screen === SCREEN_PAUSED) {
+        screen = SCREEN_PLAY;
+        announce('Playing.');
+      }
+    }
+    return actions;
+  }
+
+  function moveVector() {
+    const keys = input.keys();
+    if (keys) {
+      input.clearMoveTarget();
+      return keys;
+    }
+    const target = input.moveTarget();
+    if (!target) return null;
+    const dx = target.x - world.state.thief.x;
+    const dy = target.y - world.state.thief.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 9) {
+      input.clearMoveTarget();
+      return null;
+    }
+    return { x: dx / dist, y: dy / dist };
+  }
+
+  function step(useEmp) {
+    if (screen === SCREEN_TITLE) {
+      // Attract mode: the room lives behind the title.
+      world.step(STEP, null, false);
+      return;
+    }
+    const events = world.step(STEP, moveVector(), useEmp);
+    if (events & EVENT_WON) {
+      endRun();
+      screen = SCREEN_WON;
+      announce(`Getaway! Total score ${world.state.totalScore}.`);
+    } else if (events & EVENT_LEVEL_DONE) {
+      screen = SCREEN_LEVEL_DONE;
+      announce(`Level cleared. Score ${world.state.levelScore}.`);
+    } else if (events & EVENT_CAUGHT) {
+      endRun();
+      screen = SCREEN_CAUGHT;
+      announce(`Caught. ${world.state.caughtReason}`);
+    } else if (events & EVENT_TIMEOUT) {
+      endRun();
+      screen = SCREEN_TIMEOUT;
+      announce("Time's up.");
+    }
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+    last = now;
+    const actions = handleActions();
+    const useEmp = Boolean(actions & ACTION_EMP);
+    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
+      let firstStep = true;
+      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
+        step(firstStep && useEmp);
+        firstStep = false;
+        accumulator -= STEP;
+      }
+    } else {
+      accumulator = 0;
+    }
+    renderer.draw(world.state, screen, best);
+  }
+
+  // R restarts the current level.
+  window.addEventListener('keydown', (event) => {
+    if (event.code === 'KeyR' && (screen === SCREEN_PLAY || screen === SCREEN_CAUGHT || screen === SCREEN_TIMEOUT)) {
+      world.startLevel(world.state.levelIndex);
+      input.clearMoveTarget();
+      screen = SCREEN_PLAY;
+      announce('Level restarted.');
+    }
+  });
+
+  // Leaving the tab pauses a running game rather than letting the clock run.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && screen === SCREEN_PLAY) {
+      screen = SCREEN_PAUSED;
+      announce('Paused.');
+    }
+  });
+
+  announce('Midnight Vault. Press Space or click to start.');
+  requestAnimationFrame(frame);
+}
+
+if (shot) runShot(shot);
+else runGame();
+
+</script>
+</body>
+</html>
